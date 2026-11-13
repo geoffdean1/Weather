@@ -189,20 +189,33 @@ const dotsOf = l => '●'.repeat(l) + '○'.repeat(3 - l);
 
 async function getJSON(url, ms = 15000) {
   const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
-  try { const r = await fetch(url, {signal: ac.signal}); if (!r.ok) throw new Error('HTTP ' + r.status); return await r.json(); }
+  try { const r = await fetch(url, {signal: ac.signal});
+    if (!r.ok) { let why = ''; try { const j = await r.json(); why = j.reason || (j.error && j.error.message) || ''; } catch (e) {} throw new Error('HTTP ' + r.status + (why ? ' – ' + why : '')); }
+    return await r.json(); }
   finally { clearTimeout(t); }
 }
 
 /* ---------- data sources ---------- */
 async function fetchForecast() {
   const ms = MODELS.map(m => m[0]).join(',');
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${S.lat}&longitude=${S.lon}` +
-    `&hourly=temperature_2m,precipitation,cloud_cover,wind_speed_10m,wind_gusts_10m,wind_direction_10m` +
-    `&daily=sunrise,sunset&models=${ms}&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch` +
-    `&timezone=${encodeURIComponent(TZ)}&forecast_days=7`;
-  const j = await getJSON(url);
-  if (!j.hourly || !j.hourly.time) throw new Error('bad forecast');
-  return j;
+  const base = `https://api.open-meteo.com/v1/forecast?latitude=${S.lat}&longitude=${S.lon}` +
+    `&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=${encodeURIComponent(TZ)}&forecast_days=7`;
+  const hv = 'temperature_2m,precipitation,cloud_cover,wind_speed_10m,wind_gusts_10m,wind_direction_10m';
+  const tiers = [
+    `${base}&hourly=${hv}&daily=sunrise,sunset&models=${ms}`,            // full: 4 models + sunrise/sunset
+    `${base}&hourly=${hv}&models=${ms}`,                                  // without daily block
+    `${base}&hourly=temperature_2m,precipitation,cloud_cover,wind_speed_10m,wind_direction_10m&models=${ms}`, // fewer variables
+    `${base}&hourly=temperature_2m,precipitation,cloud_cover,wind_speed_10m,wind_direction_10m`        // single best-match model
+  ];
+  let lastErr;
+  for (let i = 0; i < tiers.length; i++) {
+    try {
+      const j = await getJSON(tiers[i]);
+      if (!j.hourly || !j.hourly.time) throw new Error('forecast response had no hourly data');
+      j._tier = i; return j;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
 }
 async function fetchNWS() {
   const key = `${(+S.lat).toFixed(4)},${(+S.lon).toFixed(4)}`;
@@ -236,7 +249,7 @@ async function fetchTides() {
 /* ---------- processing ---------- */
 function processForecast(fc, nws) {
   const H = fc.hourly, n = H.time.length;
-  const arr = (v, m) => H[`${v}_${m}`] || null;
+  const arr = (v, m) => H[`${v}_${m}`] || (m === MODELS[0][0] && !H[`${v}_${m}`] && !Object.keys(H).some(k => k.startsWith(v + '_')) ? H[v] : null) || null;
   const popMap = new Map(); (nws || []).forEach(p => popMap.set(Math.round(p.ms / 3600000), p.pop));
   const sr = pick(fc.daily, 'sunrise') || [], ss = pick(fc.daily, 'sunset') || [], dd = (fc.daily && fc.daily.time) || [];
   const sun = {}; dd.forEach((d, i) => { if (sr[i] && ss[i]) sun[d] = {sr: parseLocal(sr[i]).getTime(), ss: parseLocal(ss[i]).getTime()}; });
@@ -271,7 +284,7 @@ function processForecast(fc, nws) {
   return {hrs, days};
 }
 function agree(w, n) {
-  if (!n) return {lvl: 0, label: '—'};
+  if (n < 2) return {lvl: 0, label: 'n/a'};
   const s = w / n;
   if (s <= 0.15 || s >= 0.85) return {lvl: 3, label: 'High'};
   if (s <= 0.35 || s >= 0.65) return {lvl: 2, label: 'Medium'};
@@ -376,12 +389,14 @@ function attachHover(root, c, o, fmt, readout) {
 function banner() {
   const n = [];
   const names = {fc: 'Forecast', nws: 'NWS rain chances', marine: 'Swell', tides: 'Tides'};
-  Object.keys(stale).forEach(k => { if (stale[k] && D[k]) n.push(`${names[k]}: couldn’t refresh — showing data saved ${fmtTime(new Date(D.t[k]))}.`); else if (stale[k]) n.push(`${names[k]}: unavailable right now.`); });
+  Object.keys(stale).forEach(k => { if (!stale[k]) return; const why = typeof stale[k] === 'string' ? ` (${stale[k]})` : '';
+    if (D[k]) n.push(`${names[k]}: couldn’t refresh${why} — showing data saved ${fmtTime(new Date(D.t[k]))}.`); else n.push(`${names[k]}: unavailable right now${why}.`); });
+  if (D.fc && D.fc._tier > 0 && !stale.fc) n.push(D.fc._tier === 3 ? 'Only one weather model could be loaded, so model agreement isn’t available.' : 'Running in reduced mode (some forecast fields unavailable).');
   $('#notes').innerHTML = n.map(t => `<div class="note">${esc(t)}</div>`).join('');
 }
 function renderToday() {
   const el = $('#v-today');
-  if (!derived) { el.innerHTML = `<div class="card"><h2>Forecast</h2><p class="err">${stale.fc ? 'Couldn’t load the forecast. Check your connection and tap ↻.' : 'Loading…'}</p></div>`; return; }
+  if (!derived) { el.innerHTML = `<div class="card"><h2>Forecast</h2><p class="err">${stale.fc ? 'Couldn’t load the forecast. Check your connection and tap ↻. Details are in the orange box above.' : 'Loading…'}</p></div>`; return; }
   const {hrs, days} = derived, now = Date.now();
   let i0 = hrs.findIndex(h => h.ms >= floorHour(now)); if (i0 < 0) i0 = 0;
   const next = hrs.slice(i0, i0 + 24), cur = next[0];
@@ -393,7 +408,7 @@ function renderToday() {
     Wind ${compass(cur.dir)} ${Math.round(cur.wind || 0)} mph${cur.gust != null ? `, gusts ${Math.round(cur.gust)}` : ''}</div></div>
     <p class="headline">${esc(hl.head)}</p>${hl.day ? `<p class="day">${esc(hl.day)}</p>` : ''}
     <div class="stat">Expected rain next 24 h: <b>${inch(hl.total)} in</b> (models range ${rng} in)</div>
-    ${hl.nM ? `<div class="conf" title="How many weather models agree it will rain"><span class="dots" aria-hidden="true">${dotsOf(hl.ag.lvl)}</span><span>${hl.ag.label} agreement — ${hl.wetM} of ${hl.nM} models expect measurable rain</span></div>` : ''}</div>`;
+    ${hl.nM > 1 ? `<div class="conf" title="How many weather models agree it will rain"><span class="dots" aria-hidden="true">${dotsOf(hl.ag.lvl)}</span><span>${hl.ag.label} agreement — ${hl.wetM} of ${hl.nM} models expect measurable rain</span></div>` : ''}</div>`;
   h += `<div class="card"><h2>Next 24 hours</h2><div class="tl" id="tl">` + next.map((x, i) => {
     const frac = x.n ? x.wet / x.n : 0;
     return `<button class="col${x.night ? ' night' : ''}" data-i="${i}" aria-label="${fmtHour(x.d)}: ${x.pop}% chance, ${x.wet} of ${x.n} models show rain">
@@ -526,7 +541,8 @@ async function refresh() {
   const jobs = {fc: fetchForecast(), nws: fetchNWS(), marine: fetchMarine(), tides: fetchTides()};
   const keys = Object.keys(jobs), res = await Promise.allSettled(keys.map(k => jobs[k]));
   res.forEach((r, i) => { const k = keys[i];
-    if (r.status === 'fulfilled') { D[k] = r.value; D.t[k] = Date.now(); stale[k] = false; } else stale[k] = true; });
+    if (r.status === 'fulfilled') { D[k] = r.value; D.t[k] = Date.now(); stale[k] = false; }
+    else stale[k] = (r.reason && (r.reason.message || String(r.reason))) || 'unknown error'; });
   save('hw_cache', D); rebuild(); renderAll();
   $('#btn-ref').classList.remove('spin'); busy = false;
 }
